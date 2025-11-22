@@ -1,0 +1,113 @@
+# app.py
+from flask import Flask, request, jsonify
+import numpy as np
+import faiss
+import pickle
+import csv
+from datetime import datetime
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from sentence_transformers import SentenceTransformer
+
+app = Flask(__name__)
+
+# ----------------------------
+# Load saved embeddings + chunks
+# ----------------------------
+with open("chunks.pkl", "rb") as f:
+    chunks = pickle.load(f)
+
+with open("embeddings.pkl", "rb") as f:
+    embeddings = pickle.load(f)
+
+# Normalize embeddings for cosine similarity
+embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+dimension = embeddings.shape[1]
+
+# FAISS index
+index = faiss.IndexFlatIP(dimension)
+index.add(embeddings)
+
+# Embedding model (for query)
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+
+# ----------------------------
+# Load saved Mistral model
+# ----------------------------
+save_path = "mistral_model_local"
+tokenizer = AutoTokenizer.from_pretrained(save_path)
+model = AutoModelForCausalLM.from_pretrained(save_path, device_map="auto", torch_dtype="auto")
+
+qa_pipeline = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    max_new_tokens=300,
+    temperature=0.3,
+    top_p=0.9
+)
+
+# ----------------------------
+# Logging
+# ----------------------------
+LOG_FILE = "student_progress.csv"
+
+def log_interaction(student_id, mode, query, result):
+    with open(LOG_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        if f.tell() == 0:
+            writer.writerow(["timestamp", "student_id", "mode", "query", "result"])
+        writer.writerow([datetime.now(), student_id, mode, query, result])
+
+# ----------------------------
+# Helper functions
+# ----------------------------
+def retrieve_context(query, k=3):
+    q_emb = embedder.encode([query], convert_to_numpy=True)
+    q_emb = q_emb / np.linalg.norm(q_emb, axis=1, keepdims=True)
+    D, I = index.search(q_emb, k)
+    return "\n".join([chunks[i] for i in I[0]])
+
+def answer_question(query, student_id="student1"):
+    context = retrieve_context(query)
+    prompt = f"You are a helpful tutor.\nContext:\n{context}\nQuestion: {query}\nAnswer:"
+    response = qa_pipeline(prompt)[0]["generated_text"]
+    log_interaction(student_id, "Q&A", query, response)
+    return response
+
+def generate_quiz(query, student_id="student1"):
+    context = retrieve_context(query)
+    prompt = f"You are a tutor.\nFrom the following context, create 3 multiple-choice questions.\nContext:\n{context}"
+    response = qa_pipeline(prompt)[0]["generated_text"]
+    log_interaction(student_id, "Quiz", query, response)
+    return response
+
+def summarize_topic(query, student_id="student1"):
+    context = retrieve_context(query)
+    prompt = f"You are a tutor.\nSummarize the following context in simple, clear language for a student.\nContext:\n{context}"
+    response = qa_pipeline(prompt)[0]["generated_text"]
+    log_interaction(student_id, "Summary", query, response)
+    return response
+
+# ----------------------------
+# Flask routes
+# ----------------------------
+@app.route("/ask", methods=["POST"])
+def ask():
+    data = request.json
+    query = data.get("query", "")
+    student_id = data.get("student_id", "student1")
+    mode = data.get("mode", "qa")  # "qa", "quiz", "summary"
+
+    if mode == "qa":
+        result = answer_question(query, student_id)
+    elif mode == "quiz":
+        result = generate_quiz(query, student_id)
+    elif mode == "summary":
+        result = summarize_topic(query, student_id)
+    else:
+        result = "Invalid mode"
+
+    return jsonify({"response": result})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
